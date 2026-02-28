@@ -1,0 +1,14 @@
+name = "medinv"
+main = "src/worker.js"
+compatibility_date = "2026-02-28"
+workers_dev = true
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[[d1_databases]]
+binding = "medinv"
+database_name = "medinv"
+database_id = "e0f15858-0119-43e5-aa6a-f8911809ccba"
+migrations_dir = "migrations"
