@@ -29,6 +29,10 @@ async function handleApiRequest(request, env, url) {
       return createMedication(request, env);
     }
 
+    if (url.pathname === "/api/barcode-lookup" && request.method === "GET") {
+      return lookupBarcodeCatalog(env, url);
+    }
+
     if (url.pathname.startsWith("/api/medications/") && request.method === "DELETE") {
       const id = parsePositiveInt(url.pathname.replace("/api/medications/", ""));
       if (!id) {
@@ -52,6 +56,11 @@ async function listMedications(env) {
       manufacturer,
       active_ingredient AS activeIngredient,
       expiry_date AS expiryDate,
+      barcode_code AS barcodeCode,
+      gtin,
+      lot_number AS lotNumber,
+      serial_number AS serialNumber,
+      barcode_format AS barcodeFormat,
       created_at AS createdAt
     FROM medications
     ORDER BY expiry_date ASC, created_at DESC`
@@ -70,6 +79,12 @@ async function createMedication(request, env) {
   const manufacturer = asText(body.manufacturer);
   const activeIngredient = asText(body.activeIngredient);
   const expiryDate = normalizeDate(asText(body.expiryDate));
+  const barcode = typeof body.barcode === "object" && body.barcode ? body.barcode : {};
+  const barcodeCode = normalizeBarcodeCode(asText(barcode.code));
+  const gtin = normalizeGtin(asText(barcode.gtin));
+  const lotNumber = asOptionalText(barcode.lotNumber, 64);
+  const serialNumber = asOptionalText(barcode.serialNumber, 96);
+  const barcodeFormat = asOptionalText(barcode.format, 40);
 
   if (name.length < 2 || name.length > 120) {
     return json({ error: "name must be between 2 and 120 chars." }, 400);
@@ -83,13 +98,50 @@ async function createMedication(request, env) {
   if (!expiryDate) {
     return json({ error: "expiryDate must be a valid date." }, 400);
   }
+  if (barcodeCode && barcodeCode.length < 4) {
+    return json({ error: "barcode.code must be at least 4 chars if provided." }, 400);
+  }
+  if (gtin && !/^\d{8,18}$/.test(gtin)) {
+    return json({ error: "barcode.gtin must be 8 to 18 digits." }, 400);
+  }
 
   const insert = await env.medinv.prepare(
-    `INSERT INTO medications (name, manufacturer, active_ingredient, expiry_date)
-     VALUES (?1, ?2, ?3, ?4)`
+    `INSERT INTO medications (
+      name,
+      manufacturer,
+      active_ingredient,
+      expiry_date,
+      barcode_code,
+      gtin,
+      lot_number,
+      serial_number,
+      barcode_format
+    )
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`
   )
-    .bind(name, manufacturer, activeIngredient, expiryDate)
+    .bind(
+      name,
+      manufacturer,
+      activeIngredient,
+      expiryDate,
+      barcodeCode || null,
+      gtin || null,
+      lotNumber || null,
+      serialNumber || null,
+      barcodeFormat || null
+    )
     .run();
+
+  if (barcodeCode || gtin) {
+    await upsertBarcodeCatalog(env, {
+      code: barcodeCode || gtin,
+      gtin: gtin || null,
+      name,
+      manufacturer,
+      activeIngredient,
+      expiryDate
+    });
+  }
 
   const id = insert.meta?.last_row_id;
   const created = await env.medinv.prepare(
@@ -99,6 +151,11 @@ async function createMedication(request, env) {
       manufacturer,
       active_ingredient AS activeIngredient,
       expiry_date AS expiryDate,
+      barcode_code AS barcodeCode,
+      gtin,
+      lot_number AS lotNumber,
+      serial_number AS serialNumber,
+      barcode_format AS barcodeFormat,
       created_at AS createdAt
     FROM medications
     WHERE id = ?1`
@@ -107,6 +164,33 @@ async function createMedication(request, env) {
     .first();
 
   return json({ item: created }, 201);
+}
+
+async function lookupBarcodeCatalog(env, url) {
+  const code = normalizeBarcodeCode(asText(url.searchParams.get("code")));
+  if (!code) {
+    return json({ error: "code query parameter is required." }, 400);
+  }
+
+  const maybeGtin = normalizeGtin(code);
+  const item = await env.medinv
+    .prepare(
+      `SELECT
+        code,
+        gtin,
+        name,
+        manufacturer,
+        active_ingredient AS activeIngredient,
+        last_seen_expiry_date AS expiryDate,
+        updated_at AS updatedAt
+      FROM barcode_catalog
+      WHERE code = ?1 OR (gtin = ?2 AND ?2 IS NOT NULL)
+      LIMIT 1`
+    )
+    .bind(code, maybeGtin || null)
+    .first();
+
+  return json({ item: item || null }, 200);
 }
 
 async function deleteMedication(env, id) {
@@ -157,6 +241,13 @@ function asText(value) {
     return "";
   }
   return value.trim();
+}
+
+function asOptionalText(value, maxLength) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value.trim().slice(0, maxLength);
 }
 
 async function safeJson(request) {
@@ -240,4 +331,52 @@ function isValidIsoDate(value) {
       Number.parseInt(parsed[1], 10)
     )
   );
+}
+
+function normalizeBarcodeCode(value) {
+  return String(value || "")
+    .replace(/^\][A-Za-z0-9]{2}/, "")
+    .replaceAll("\u001d", "")
+    .replaceAll("\u241d", "")
+    .replace(/\s+/g, "")
+    .slice(0, 220);
+}
+
+function normalizeGtin(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.length < 8 || digits.length > 18) {
+    return "";
+  }
+  return digits;
+}
+
+async function upsertBarcodeCatalog(env, item) {
+  await env.medinv
+    .prepare(
+      `INSERT INTO barcode_catalog (
+        code,
+        gtin,
+        name,
+        manufacturer,
+        active_ingredient,
+        last_seen_expiry_date,
+        updated_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+      ON CONFLICT(code) DO UPDATE SET
+        gtin = excluded.gtin,
+        name = excluded.name,
+        manufacturer = excluded.manufacturer,
+        active_ingredient = excluded.active_ingredient,
+        last_seen_expiry_date = excluded.last_seen_expiry_date,
+        updated_at = CURRENT_TIMESTAMP`
+    )
+    .bind(
+      item.code,
+      item.gtin || null,
+      item.name,
+      item.manufacturer,
+      item.activeIngredient,
+      item.expiryDate
+    )
+    .run();
 }

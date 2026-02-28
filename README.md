@@ -4,8 +4,8 @@ Mobile-first Medikamenten-Inventur mit Cloudflare:
 
 - Felder: `name`, `manufacturer`, `activeIngredient`, `expiryDate`
 - 2 Erfassungswege:
-  - manuelle Eingabe per Tastatur
-  - Foto/Kamera mit OCR-gestuetztem Autofill
+  - Barcode-Scan per Kamera (empfohlen, iPhone)
+  - manuelle Eingabe und Foto/OCR als Fallback
 - Loeschen von Eintraegen
 - Kein Login (jeder mit Link kann zugreifen)
 - PWA faehig (installierbar auf Mobilgeraeten)
@@ -14,6 +14,7 @@ Mobile-first Medikamenten-Inventur mit Cloudflare:
 
 - Frontend: Vanilla HTML/CSS/JS (PWA + Service Worker)
 - OCR: Tesseract.js im Browser
+- Barcode-Scan: html5-qrcode (DataMatrix, EAN, UPC, Code128)
 - Backend: Cloudflare Worker (`src/worker.js`)
 - Datenbank: Cloudflare D1 (`medications` Tabelle)
 
@@ -59,6 +60,8 @@ Remote (Cloudflare):
 npm run db:migrate:remote
 ```
 
+Hinweis: Fuer Barcode-Unterstuetzung wird auch `0002_barcode_support.sql` ausgefuehrt.
+
 ## 5) Lokal starten
 
 ```bash
@@ -80,3 +83,4 @@ Nach dem Deploy ist die App ohne Login oeffentlich ueber die Worker-URL erreichb
 - `GET /api/medications` - Liste
 - `POST /api/medications` - Eintrag erstellen
 - `DELETE /api/medications/:id` - Eintrag loeschen
+- `GET /api/barcode-lookup?code=...` - Produktdaten fuer Barcode finden

@@ -171,6 +171,27 @@ input:focus-visible {
   gap: 8px;
 }
 
+.barcode-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.barcode-reader {
+  margin-top: 10px;
+  width: 100%;
+  min-height: 220px;
+  border-radius: var(--radius-m);
+  overflow: hidden;
+  border: 1px solid #d8e2e8;
+  background: #0f172a;
+}
+
+.barcode-reader video {
+  width: 100% !important;
+  height: auto !important;
+}
+
 .hint {
   margin: 0 0 10px;
   color: var(--ink-2);
@@ -357,4 +378,3 @@ button:disabled {
     align-items: center;
   }
 }
-

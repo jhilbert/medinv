@@ -63,7 +63,24 @@
       </section>
 
       <section class="panel">
-        <h2>2) Foto/Kamera nutzen</h2>
+        <h2>2) Barcode scannen (empfohlen)</h2>
+        <p class="hint">
+          Auf iPhone zuerst Barcode scannen. Bei GS1-DataMatrix wird Ablaufdatum direkt erkannt.
+        </p>
+        <div class="barcode-actions">
+          <button id="start-scan-btn" type="button" class="secondary-btn">Kamera starten</button>
+          <button id="stop-scan-btn" type="button" class="ghost-btn hidden">Stoppen</button>
+        </div>
+        <div id="barcode-reader" class="barcode-reader hidden"></div>
+        <p id="barcode-status" class="status-message" role="status"></p>
+        <details class="ocr-details">
+          <summary>Barcode-Details anzeigen</summary>
+          <pre id="barcode-text"></pre>
+        </details>
+      </section>
+
+      <section class="panel">
+        <h2>3) Foto/OCR als Fallback</h2>
         <p class="hint">
           Foto machen, Text lesen lassen und Werte bei Bedarf anpassen. Danach mit "Speichern" sichern.
         </p>
@@ -89,8 +106,8 @@
       </section>
     </main>
 
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
     <script type="module" src="/app.js"></script>
   </body>
 </html>
-

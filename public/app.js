@@ -1,7 +1,29 @@
+const GS = String.fromCharCode(29);
+const FIXED_AI_LENGTHS = {
+  "00": 18,
+  "01": 14,
+  "11": 6,
+  "15": 6,
+  "17": 6
+};
+const VARIABLE_AI_MAX_LENGTHS = {
+  "10": 20,
+  "21": 20,
+  "30": 8
+};
+const KNOWN_AI_KEYS = new Set([
+  ...Object.keys(FIXED_AI_LENGTHS),
+  ...Object.keys(VARIABLE_AI_MAX_LENGTHS)
+]);
+
 const state = {
   entries: [],
   deferredInstallPrompt: null,
-  ocrRunning: false
+  ocrRunning: false,
+  scanner: null,
+  scannerRunning: false,
+  scanHandling: false,
+  latestBarcode: null
 };
 
 const elements = {
@@ -20,7 +42,12 @@ const elements = {
   scanButton: document.querySelector("#scan-photo-btn"),
   ocrStatus: document.querySelector("#ocr-status"),
   ocrText: document.querySelector("#ocr-text"),
-  installButton: document.querySelector("#install-btn")
+  installButton: document.querySelector("#install-btn"),
+  startScanButton: document.querySelector("#start-scan-btn"),
+  stopScanButton: document.querySelector("#stop-scan-btn"),
+  barcodeReader: document.querySelector("#barcode-reader"),
+  barcodeStatus: document.querySelector("#barcode-status"),
+  barcodeText: document.querySelector("#barcode-text")
 };
 
 init().catch((error) => {
@@ -41,11 +68,17 @@ function wireEvents() {
   elements.photoInput?.addEventListener("change", onPhotoSelected);
   elements.scanButton?.addEventListener("click", onScanPhoto);
   elements.installButton?.addEventListener("click", onInstallClicked);
+  elements.startScanButton?.addEventListener("click", onStartBarcodeScanner);
+  elements.stopScanButton?.addEventListener("click", () => stopBarcodeScanner());
 
   window.addEventListener("beforeinstallprompt", (event) => {
     event.preventDefault();
     state.deferredInstallPrompt = event;
     elements.installButton?.classList.remove("hidden");
+  });
+
+  window.addEventListener("pagehide", () => {
+    void stopBarcodeScanner({ silent: true });
   });
 }
 
@@ -82,6 +115,17 @@ async function onSubmitEntry(event) {
     return;
   }
 
+  if (state.latestBarcode?.lookupCode) {
+    payload.barcode = {
+      code: state.latestBarcode.lookupCode,
+      gtin: state.latestBarcode.gtin,
+      lotNumber: state.latestBarcode.lot,
+      serialNumber: state.latestBarcode.serial,
+      format: state.latestBarcode.format,
+      raw: state.latestBarcode.raw
+    };
+  }
+
   lockForm(true);
   setStatus("Speichere...");
   try {
@@ -96,9 +140,10 @@ async function onSubmitEntry(event) {
     }
 
     elements.form?.reset();
+    clearPhotoState();
+    clearBarcodeState();
     setOcrStatus("");
-    elements.ocrText.textContent = "";
-    elements.photoPreview?.classList.add("hidden");
+    setBarcodeStatus("");
     await loadEntries();
     setStatus("Eintrag gespeichert.");
   } catch (error) {
@@ -142,6 +187,539 @@ async function onListClick(event) {
     setStatus(error.message || "Loeschen fehlgeschlagen.");
   } finally {
     button.removeAttribute("disabled");
+  }
+}
+
+async function onStartBarcodeScanner() {
+  if (state.scannerRunning || state.scanHandling) {
+    return;
+  }
+
+  if (!window.isSecureContext) {
+    setBarcodeStatus("Kamera-Scan braucht HTTPS.");
+    return;
+  }
+  if (!window.Html5Qrcode) {
+    setBarcodeStatus("Barcode-Bibliothek konnte nicht geladen werden.");
+    return;
+  }
+
+  clearBarcodeState({ keepStatus: true });
+  elements.barcodeReader?.classList.remove("hidden");
+  elements.stopScanButton?.classList.remove("hidden");
+  elements.startScanButton?.setAttribute("disabled", "true");
+  setBarcodeStatus("Starte Kamera...");
+
+  try {
+    state.scanner = new window.Html5Qrcode("barcode-reader");
+    const config = {
+      fps: 12,
+      qrbox: buildQrBox()
+    };
+    const formats = getBarcodeFormats();
+    if (formats.length > 0) {
+      config.formatsToSupport = formats;
+    }
+
+    await startScannerWithFallback(state.scanner, config);
+    state.scannerRunning = true;
+    setBarcodeStatus("Barcode in den Kamerarahmen halten.");
+  } catch (error) {
+    console.error(error);
+    setBarcodeStatus("Kamera konnte nicht gestartet werden. Zugriff bitte erlauben.");
+    await stopBarcodeScanner({ silent: true });
+  } finally {
+    elements.startScanButton?.removeAttribute("disabled");
+  }
+}
+
+async function startScannerWithFallback(scanner, config) {
+  const onDecode = (decodedText, decodedResult) => {
+    void onBarcodeDecoded(decodedText, decodedResult);
+  };
+  const ignoreDecodeErrors = () => {};
+
+  const cameraConfigs = [{ facingMode: { exact: "environment" } }, { facingMode: "environment" }];
+  let lastError = null;
+
+  for (const cameraConfig of cameraConfigs) {
+    try {
+      await scanner.start(cameraConfig, config, onDecode, ignoreDecodeErrors);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("No camera available.");
+}
+
+async function stopBarcodeScanner(options = {}) {
+  const silent = Boolean(options.silent);
+  if (state.scanner) {
+    if (state.scannerRunning) {
+      try {
+        await state.scanner.stop();
+      } catch (error) {
+        if (!silent) {
+          console.warn("Scanner stop failed", error);
+        }
+      }
+    }
+    try {
+      await state.scanner.clear();
+    } catch (error) {
+      if (!silent) {
+        console.warn("Scanner clear failed", error);
+      }
+    }
+  }
+
+  state.scanner = null;
+  state.scannerRunning = false;
+  elements.stopScanButton?.classList.add("hidden");
+  elements.barcodeReader?.classList.add("hidden");
+}
+
+async function onBarcodeDecoded(decodedText, decodedResult) {
+  if (state.scanHandling) {
+    return;
+  }
+  state.scanHandling = true;
+
+  try {
+    const parsed = parseBarcodePayload(decodedText, decodedResult);
+    state.latestBarcode = parsed;
+    const extractedFromRaw = extractMedicationFromBarcodeText(parsed.raw);
+    const rawFillCount = applyParsedValues(extractedFromRaw, { overwrite: false });
+
+    if (parsed.expiryDate && elements.expiryDate) {
+      setFieldValue(elements.expiryDate, parsed.expiryDate, true);
+    }
+
+    elements.barcodeText.textContent = JSON.stringify(
+      {
+        raw: parsed.raw,
+        format: parsed.format || "unknown",
+        lookupCode: parsed.lookupCode,
+        gtin: parsed.gtin || "",
+        expiryDate: parsed.expiryDate || "",
+        lot: parsed.lot || "",
+        serial: parsed.serial || ""
+      },
+      null,
+      2
+    );
+
+    await stopBarcodeScanner({ silent: true });
+    await lookupBarcodeCatalog(parsed, rawFillCount);
+  } finally {
+    state.scanHandling = false;
+  }
+}
+
+async function lookupBarcodeCatalog(parsed, rawFillCount = 0) {
+  const localMatch = findLocalMatch(parsed);
+  if (localMatch) {
+    const filled = applyCatalogValues(localMatch, parsed);
+    setBarcodeStatus(
+      `Barcode erkannt. Daten aus vorhandenen Eintraegen uebernommen (${filled} Feld(er)).`
+    );
+    return;
+  }
+
+  const candidates = uniqueValues([parsed.lookupCode, parsed.gtin]);
+  let match = null;
+  let lookupUnavailable = false;
+
+  for (const candidate of candidates) {
+    try {
+      const response = await fetch(`/api/barcode-lookup?code=${encodeURIComponent(candidate)}`);
+      const payload = await response.json();
+      if (!response.ok) {
+        lookupUnavailable = true;
+        continue;
+      }
+      if (response.ok && payload.item) {
+        match = payload.item;
+        break;
+      }
+    } catch (error) {
+      lookupUnavailable = true;
+      console.warn("Barcode lookup failed", error);
+    }
+  }
+
+  if (match) {
+    const filled = applyCatalogValues(match, parsed);
+    setBarcodeStatus(`Barcode erkannt. Produktdaten aus Katalog geladen (${filled} Feld(er)).`);
+    return;
+  }
+
+  const extracted = [];
+  if (parsed.gtin) extracted.push("GTIN");
+  if (parsed.expiryDate) extracted.push("Ablaufdatum");
+  if (parsed.lot) extracted.push("Charge");
+  if (rawFillCount > 0) extracted.push(`${rawFillCount} QR-Feld(er)`);
+  const details = extracted.length ? ` Erkannt: ${extracted.join(", ")}.` : "";
+  const lookupHint = lookupUnavailable
+    ? " Katalog-Lookup nicht verfuegbar (DB-Migration 0002 ausfuehren)."
+    : "";
+  setBarcodeStatus(
+    `Barcode erkannt.${details}${lookupHint} Produkt ist neu. Bitte Daten einmal ausfuellen und speichern.`
+  );
+}
+
+function applyCatalogValues(item, parsed) {
+  const normalized = normalizeMedicationObject(item);
+  if (parsed.expiryDate) {
+    normalized.expiryDate = "";
+  }
+  return applyParsedValues(normalized, { overwrite: true });
+}
+
+function parseBarcodePayload(decodedText, decodedResult) {
+  const raw = compact(decodedText);
+  const normalizedRaw = normalizeBarcodeRaw(raw);
+  const barcodeBody = stripSymbologyPrefix(normalizedRaw);
+  const gs1 = parseGs1Payload(barcodeBody);
+
+  const gtin = normalizeGtin(gs1["01"] || "");
+  const expiryDate = parseGs1Expiry(gs1["17"] || "");
+  const lot = sanitizeGs1Value(gs1["10"] || "");
+  const serial = sanitizeGs1Value(gs1["21"] || "");
+  const normalizedCode = normalizeBarcodeCode(barcodeBody);
+  const lookupCode = gtin || (normalizedCode.length >= 4 ? normalizedCode : "");
+
+  return {
+    raw,
+    normalizedRaw,
+    format: extractBarcodeFormat(decodedResult),
+    lookupCode,
+    gtin,
+    expiryDate,
+    lot,
+    serial
+  };
+}
+
+function parseGs1Payload(raw) {
+  if (!raw) return {};
+  if (/\(\d{2,4}\)/.test(raw)) {
+    return parseBracketGs1(raw);
+  }
+  return parseLinearGs1(raw);
+}
+
+function parseBracketGs1(raw) {
+  const fields = {};
+  const matches = Array.from(raw.matchAll(/\((\d{2,4})\)/g));
+  if (matches.length === 0) {
+    return fields;
+  }
+
+  for (let i = 0; i < matches.length; i += 1) {
+    const ai = matches[i][1];
+    const start = (matches[i].index ?? 0) + matches[i][0].length;
+    const end = i + 1 < matches.length ? matches[i + 1].index ?? raw.length : raw.length;
+    const value = sanitizeGs1Value(raw.slice(start, end));
+    if (value) {
+      fields[ai] = value;
+    }
+  }
+
+  return fields;
+}
+
+function parseLinearGs1(raw) {
+  const fields = {};
+  let cursor = 0;
+
+  while (cursor < raw.length) {
+    if (raw[cursor] === GS) {
+      cursor += 1;
+      continue;
+    }
+
+    const ai = detectAiAt(raw, cursor);
+    if (!ai) {
+      break;
+    }
+    cursor += ai.length;
+
+    if (ai in FIXED_AI_LENGTHS) {
+      const fixedLen = FIXED_AI_LENGTHS[ai];
+      const value = sanitizeGs1Value(raw.slice(cursor, cursor + fixedLen));
+      if (value) {
+        fields[ai] = value;
+      }
+      cursor += fixedLen;
+      continue;
+    }
+
+    const maxLen = VARIABLE_AI_MAX_LENGTHS[ai] || 30;
+    let end = cursor;
+    while (end < raw.length && raw[end] !== GS && end - cursor < maxLen) {
+      end += 1;
+    }
+    const value = sanitizeGs1Value(raw.slice(cursor, end));
+    if (value) {
+      fields[ai] = value;
+    }
+    cursor = end;
+  }
+
+  return fields;
+}
+
+function detectAiAt(raw, cursor) {
+  const sizes = [4, 3, 2];
+  for (const size of sizes) {
+    const ai = raw.slice(cursor, cursor + size);
+    if (KNOWN_AI_KEYS.has(ai)) {
+      return ai;
+    }
+  }
+  return null;
+}
+
+function parseGs1Expiry(value) {
+  const compactValue = compact(value);
+  if (!/^\d{6}$/.test(compactValue)) {
+    return "";
+  }
+
+  const year = 2000 + Number.parseInt(compactValue.slice(0, 2), 10);
+  const month = Number.parseInt(compactValue.slice(2, 4), 10);
+  let day = Number.parseInt(compactValue.slice(4, 6), 10);
+
+  if (day === 0) {
+    day = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  }
+  return toIsoDate(day, month, year);
+}
+
+function extractBarcodeFormat(decodedResult) {
+  return compact(
+    decodedResult?.result?.format?.formatName ||
+      decodedResult?.result?.formatName ||
+      decodedResult?.format?.formatName ||
+      decodedResult?.formatName ||
+      ""
+  );
+}
+
+function getBarcodeFormats() {
+  const formats = window.Html5QrcodeSupportedFormats;
+  if (!formats) {
+    return [];
+  }
+  return [
+    formats.DATA_MATRIX,
+    formats.EAN_13,
+    formats.EAN_8,
+    formats.UPC_A,
+    formats.UPC_E,
+    formats.CODE_128,
+    formats.CODE_39,
+    formats.ITF
+  ].filter((entry) => Number.isInteger(entry));
+}
+
+function buildQrBox() {
+  const width = Math.max(180, Math.min(window.innerWidth - 42, 360));
+  return { width: Math.round(width), height: Math.round(width * 0.62) };
+}
+
+function normalizeBarcodeRaw(value) {
+  return String(value || "")
+    .replaceAll("\u241d", GS)
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+function stripSymbologyPrefix(value) {
+  return String(value || "").replace(/^\][A-Za-z0-9]{2}/, "");
+}
+
+function normalizeBarcodeCode(value) {
+  return stripSymbologyPrefix(String(value || ""))
+    .replaceAll(GS, "")
+    .replaceAll("\u241d", "")
+    .replace(/\s+/g, "")
+    .slice(0, 220);
+}
+
+function normalizeGtin(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.length < 8 || digits.length > 18) {
+    return "";
+  }
+  return digits;
+}
+
+function sanitizeGs1Value(value) {
+  return String(value || "")
+    .replaceAll(GS, "")
+    .replaceAll("\u241d", "")
+    .trim();
+}
+
+function uniqueValues(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
+}
+
+function extractMedicationFromBarcodeText(rawText) {
+  const raw = String(rawText || "").trim();
+  if (!raw) {
+    return {};
+  }
+
+  const fromJson = parseMedicationFromJson(raw);
+  if (Object.keys(fromJson).length > 0) {
+    return fromJson;
+  }
+
+  const fromUrl = parseMedicationFromUrl(raw);
+  const fromKv = parseMedicationFromKeyValue(raw);
+  const fromFreeText = parseMedicationText(raw);
+
+  return {
+    ...fromFreeText,
+    ...fromKv,
+    ...fromUrl
+  };
+}
+
+function parseMedicationFromJson(raw) {
+  if (!(raw.startsWith("{") && raw.endsWith("}"))) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return normalizeMedicationObject(parsed);
+  } catch {
+    return {};
+  }
+}
+
+function parseMedicationFromUrl(raw) {
+  if (!/^https?:\/\//i.test(raw)) {
+    return {};
+  }
+  try {
+    const url = new URL(raw);
+    const params = url.searchParams;
+    return normalizeMedicationObject({
+      name: params.get("name") || params.get("medicine") || params.get("medication") || "",
+      manufacturer: params.get("manufacturer") || params.get("maker") || "",
+      activeIngredient:
+        params.get("activeIngredient") ||
+        params.get("active_ingredient") ||
+        params.get("ingredient") ||
+        "",
+      expiryDate: params.get("expiryDate") || params.get("expiry") || params.get("exp") || ""
+    });
+  } catch {
+    return {};
+  }
+}
+
+function parseMedicationFromKeyValue(raw) {
+  const pick = (regex) => compact(raw.match(regex)?.[1] || "");
+  return normalizeMedicationObject({
+    name: pick(/(?:^|[\n;|,])\s*(?:name|medikament|produkt)\s*[:=]\s*([^\n;|,]+)/i),
+    manufacturer: pick(/(?:^|[\n;|,])\s*(?:manufacturer|hersteller|firma)\s*[:=]\s*([^\n;|,]+)/i),
+    activeIngredient: pick(
+      /(?:^|[\n;|,])\s*(?:wirkstoff|active[_\s-]?ingredient|ingredient)\s*[:=]\s*([^\n;|,]+)/i
+    ),
+    expiryDate: pick(
+      /(?:^|[\n;|,])\s*(?:exp(?:iry)?|mhd|expiry[_\s-]?date|ablauf(?:datum)?)\s*[:=]\s*([^\n;|,]+)/i
+    )
+  });
+}
+
+function normalizeMedicationObject(item) {
+  const value = item || {};
+  return {
+    name: compact(
+      value.name || value.medicineName || value.medicationName || value.medication || value.produkt || ""
+    ),
+    manufacturer: compact(
+      value.manufacturer || value.hersteller || value.vendor || value.company || ""
+    ),
+    activeIngredient: compact(
+      value.activeIngredient ||
+        value.active_ingredient ||
+        value.wirkstoff ||
+        value.ingredient ||
+        value.substance ||
+        ""
+    ),
+    expiryDate: compact(
+      value.expiryDate ||
+        value.expiry_date ||
+        value.expiry ||
+        value.exp ||
+        value.mhd ||
+        value.ablaufdatum ||
+        ""
+    )
+  };
+}
+
+function findLocalMatch(parsed) {
+  const wantedCode = normalizeBarcodeCode(parsed.lookupCode || "");
+  const wantedGtin = normalizeGtin(parsed.gtin || "");
+
+  return state.entries.find((entry) => {
+    const entryCode = normalizeBarcodeCode(entry.barcodeCode || "");
+    const entryGtin = normalizeGtin(entry.gtin || "");
+    if (wantedCode && entryCode && entryCode === wantedCode) {
+      return true;
+    }
+    if (wantedGtin && entryGtin && entryGtin === wantedGtin) {
+      return true;
+    }
+    return false;
+  });
+}
+
+function setFieldValue(input, value, overwrite) {
+  if (!input || !value) {
+    return 0;
+  }
+  if (!overwrite && input.value.trim()) {
+    return 0;
+  }
+  if (input.value === value) {
+    return 0;
+  }
+  input.value = value;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+  return 1;
+}
+
+function clearBarcodeState(options = {}) {
+  state.latestBarcode = null;
+  if (elements.barcodeText) {
+    elements.barcodeText.textContent = "";
+  }
+  if (!options.keepStatus) {
+    setBarcodeStatus("");
   }
 }
 
@@ -275,11 +853,21 @@ function parseMedicationText(rawText) {
   return parsed;
 }
 
-function applyParsedValues(values) {
-  if (values.name) elements.name.value = values.name;
-  if (values.manufacturer) elements.manufacturer.value = values.manufacturer;
-  if (values.activeIngredient) elements.activeIngredient.value = values.activeIngredient;
-  if (values.expiryDate) elements.expiryDate.value = values.expiryDate;
+function applyParsedValues(values, options = {}) {
+  const overwrite = options.overwrite !== false;
+  let filled = 0;
+
+  filled += setFieldValue(elements.name, values?.name, overwrite);
+  filled += setFieldValue(elements.manufacturer, values?.manufacturer, overwrite);
+  filled += setFieldValue(elements.activeIngredient, values?.activeIngredient, overwrite);
+
+  if (values?.expiryDate && elements.expiryDate) {
+    const normalizedExpiry = normalizeDateInput(values.expiryDate);
+    if (normalizedExpiry) {
+      filled += setFieldValue(elements.expiryDate, normalizedExpiry, overwrite);
+    }
+  }
+  return filled;
 }
 
 function renderEntries() {
@@ -291,6 +879,10 @@ function renderEntries() {
 function renderCard(entry) {
   const expiry = formatDate(entry.expiryDate);
   const expiryBadge = getExpiryBadge(entry.expiryDate);
+  const barcodeInfo = entry.gtin
+    ? `<p class="med-detail"><strong>GTIN:</strong> ${escapeHtml(entry.gtin)}</p>`
+    : "";
+
   return `
     <article class="med-card">
       <div class="med-head">
@@ -300,6 +892,7 @@ function renderCard(entry) {
       <p class="med-detail"><strong>Hersteller:</strong> ${escapeHtml(entry.manufacturer)}</p>
       <p class="med-detail"><strong>Wirkstoff:</strong> ${escapeHtml(entry.activeIngredient)}</p>
       <p class="med-detail"><strong>Ablauf:</strong> ${escapeHtml(expiry)}</p>
+      ${barcodeInfo}
       <button class="danger-btn" type="button" data-delete-id="${entry.id}">Loeschen</button>
     </article>
   `;
@@ -342,6 +935,12 @@ function setStatus(text) {
   }
 }
 
+function setBarcodeStatus(text) {
+  if (elements.barcodeStatus) {
+    elements.barcodeStatus.textContent = text;
+  }
+}
+
 function setOcrStatus(text) {
   if (elements.ocrStatus) {
     elements.ocrStatus.textContent = text;
@@ -357,6 +956,19 @@ function lockForm(locked) {
       control.removeAttribute("disabled");
     }
   });
+}
+
+function clearPhotoState() {
+  if (elements.photoInput) {
+    elements.photoInput.value = "";
+  }
+  if (elements.photoPreview) {
+    elements.photoPreview.src = "";
+    elements.photoPreview.classList.add("hidden");
+  }
+  if (elements.ocrText) {
+    elements.ocrText.textContent = "";
+  }
 }
 
 function normalizeDateInput(raw) {
@@ -443,4 +1055,3 @@ async function onInstallClicked() {
   state.deferredInstallPrompt = null;
   elements.installButton?.classList.add("hidden");
 }
-
